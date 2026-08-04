@@ -84,7 +84,7 @@ This plugin is built around the following concrete requirements:
   - Protect manual changes before the next prompt is sent
 
 - Workspace restore through `/tree`
-  - Restores the matching workspace state when switching history nodes
+  - Asks what to restore on each manual jump: files only, conversation only, or both
   - Supports moving between historical branches
 
 - Dirty guard
@@ -165,6 +165,12 @@ Settings:
   - Safety budget for workspace scanning
 - `workspaceHistory.gitTimeoutMs`
   - Timeout for internal git operations
+
+Notes:
+
+- Manual `/tree` navigation always prompts what to restore: files only (conversation stays put), conversation only (files untouched), or both
+- Summarize-style navigation is treated the same as any other navigation
+- `/undo` and `/redo` always restore files
 
 ## Installation And Usage
 

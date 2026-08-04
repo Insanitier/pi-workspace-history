@@ -2013,42 +2013,98 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       state,
     );
 
-    if (event.preparation.userWantsSummary && !state.internalNavigation) {
-      ctx.ui.notify("Manual /tree with summary may desync workspace and chat state. Disable summary before switching.", "error");
-      return { cancel: true };
-    }
-
-    const currentLeafId = ctx.sessionManager.getLeafId();
-    const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
-
-    try {
-      const dirty = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
-      if (dirty) {
-        ctx.ui.notify("The workspace has unsnapshotted changes. Run /checkpoint first, or clean them up before switching.", "error");
-        return { cancel: true };
-      }
-    } catch (error) {
-      await logLine(ctx, `dirty-check failed target=${event.preparation.targetId} error=${String(error)}`, state);
-      ctx.ui.notify("Workspace dirty check failed. Tree navigation cancelled.", "error");
-      return { cancel: true };
-    }
-
     const snapshot = resolveSnapshotForTreeTarget(ctx, event.preparation.targetId, state);
     const snapshotData = getResolvedSnapshotData(snapshot);
-    if (!snapshotData) {
-      ctx.ui.notify("This history node has no workspace snapshot. Cannot restore precisely.", "error");
-      return { cancel: true };
+
+    // Internal /undo and /redo always restore files — that is their purpose.
+    if (state.internalNavigation) {
+      if (!snapshotData) {
+        ctx.ui.notify("This history node has no workspace snapshot. Cannot restore precisely.", "error");
+        return { cancel: true };
+      }
+
+      try {
+        await restoreResolvedSnapshot(pi, ctx, state.internalNavigation, event.preparation.targetId, snapshotData, state);
+      } catch (error) {
+        await logLine(
+          ctx,
+          `restore source=${state.internalNavigation} target=${event.preparation.targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} error=${String(error)}`,
+          state,
+        );
+        ctx.ui.notify("Workspace restore failed. Tree navigation cancelled.", "error");
+        return { cancel: true };
+      }
+
+      return undefined;
     }
 
-    try {
-      await restoreResolvedSnapshot(pi, ctx, state.internalNavigation ?? "tree", event.preparation.targetId, snapshotData, state);
-    } catch (error) {
-      await logLine(
-        ctx,
-        `restore source=${state.internalNavigation ?? "tree"} target=${event.preparation.targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} error=${String(error)}`,
-        state,
+    // Manual /tree navigation: always ask what to restore, like pi-rewind / @ayulab.
+    // No special-casing for summarize navigation — every jump behaves the same.
+    let restoreFiles = false;
+    let filesOnly = false;
+
+    if (ctx.hasUI) {
+      const choice = await ctx.ui.select(
+        "Restore workspace state for this history node?",
+        [
+          "Restore files only (keep conversation)",
+          "Restore conversation only (keep files)",
+          "Restore files and conversation",
+        ],
       );
-      ctx.ui.notify("Workspace restore failed. Tree navigation cancelled.", "error");
+      if (choice === "Restore files only (keep conversation)") {
+        restoreFiles = true;
+        filesOnly = true;
+      } else if (choice === "Restore files and conversation") {
+        restoreFiles = true;
+      } else {
+        // Conversation only, or dismissed — files untouched.
+        await logLine(ctx, `session_before_tree restore=conversation-only target=${event.preparation.targetId}`, state);
+        return undefined;
+      }
+    } else {
+      // Headless fallback: previous behavior.
+      restoreFiles = true;
+    }
+
+    if (restoreFiles) {
+      if (!snapshotData) {
+        ctx.ui.notify("This history node has no workspace snapshot. Cannot restore precisely.", "error");
+        return { cancel: true };
+      }
+
+      const currentLeafId = ctx.sessionManager.getLeafId();
+      const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
+
+      try {
+        const dirty = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
+        if (dirty) {
+          ctx.ui.notify("The workspace has unsnapshotted changes. Run /checkpoint first, or clean them up before switching.", "error");
+          return { cancel: true };
+        }
+      } catch (error) {
+        await logLine(ctx, `dirty-check failed target=${event.preparation.targetId} error=${String(error)}`, state);
+        ctx.ui.notify("Workspace dirty check failed. Tree navigation cancelled.", "error");
+        return { cancel: true };
+      }
+
+      try {
+        await restoreResolvedSnapshot(pi, ctx, filesOnly ? "tree-files-only" : "tree", event.preparation.targetId, snapshotData, state);
+      } catch (error) {
+        await logLine(
+          ctx,
+          `restore source=${filesOnly ? "tree-files-only" : "tree"} target=${event.preparation.targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} error=${String(error)}`,
+          state,
+        );
+        ctx.ui.notify("Workspace restore failed. Tree navigation cancelled.", "error");
+        return { cancel: true };
+      }
+    }
+
+    if (filesOnly) {
+      // Files restored to the target node's snapshot; keep the conversation
+      // where it is by cancelling the jump.
+      await logLine(ctx, `session_before_tree files-only: navigation cancelled target=${event.preparation.targetId}`, state);
       return { cancel: true };
     }
 
