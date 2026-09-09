@@ -121,11 +121,6 @@ interface RuntimeState {
   initializationNoticeShown?: boolean;
 }
 
-interface NavigationPrecheckResult {
-  currentLeafId?: string;
-  currentSnapshot?: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot>;
-}
-
 interface WorkspaceHistorySettings {
   enabled: boolean | "auto";
   allowHomeDirectory: boolean;
@@ -689,15 +684,6 @@ async function getSnapshotIgnoreMatcher(ctx: ExtensionContext, state?: RuntimeSt
   return matcher;
 }
 
-async function filterSnapshotPaths(
-  ctx: ExtensionContext,
-  relativePaths: string[],
-  state?: RuntimeState,
-): Promise<string[]> {
-  const matcher = await getSnapshotIgnoreMatcher(ctx, state);
-  return relativePaths.filter((relativePath) => !matcher.ignores(normalizeSnapshotPath(relativePath)) && !isWindowsReservedSnapshotPath(relativePath));
-}
-
 async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: RuntimeState): Promise<string[]> {
   const matcher = await getSnapshotIgnoreMatcher(ctx, state);
   const budget = await getScanBudget(ctx, state);
@@ -743,12 +729,6 @@ async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: Runtime
 
   await walk();
   return excludedPaths;
-}
-
-function parseNullSeparatedPaths(raw: string): string[] {
-  return raw
-    .split("\0")
-    .filter((line) => line.length > 0);
 }
 
 async function logLine(ctx: ExtensionContext, line: string, state?: RuntimeState): Promise<void> {
@@ -1100,11 +1080,6 @@ async function restoreSnapshotCommitSafely(
   }
 }
 
-async function readRedoState(ctx: ExtensionContext, state?: RuntimeState): Promise<RedoState | undefined> {
-  const paths = await getWorkspaceStoragePaths(ctx, state);
-  return readJsonFile<RedoState>(paths.redoFile);
-}
-
 async function writeRedoState(ctx: ExtensionContext, redoState: RedoState, state?: RuntimeState): Promise<void> {
   const paths = await ensureStorageDirs(ctx, state);
   await writeFile(paths.redoFile, `${JSON.stringify(redoState, null, 2)}\n`, "utf8");
@@ -1181,38 +1156,6 @@ async function clearRedoStack(ctx: ExtensionContext, state?: RuntimeState): Prom
   }, state);
 }
 
-async function pushRedoTarget(ctx: ExtensionContext, targetId: string, state?: RuntimeState): Promise<void> {
-  const sessionId = ctx.sessionManager.getSessionId();
-  const redoState = (await readRedoState(ctx, state)) ?? { sessionId, stack: [] };
-  const next: RedoState = {
-    sessionId,
-    stack: [...(redoState.sessionId === sessionId ? redoState.stack : []), { targetId, createdAt: new Date().toISOString() }],
-  };
-  await writeRedoState(ctx, next, state);
-}
-
-async function popRedoTarget(ctx: ExtensionContext, state?: RuntimeState): Promise<RedoItem | undefined> {
-  const sessionId = ctx.sessionManager.getSessionId();
-  const redoState = await readRedoState(ctx, state);
-  if (!redoState || redoState.sessionId !== sessionId || redoState.stack.length === 0) {
-    return undefined;
-  }
-
-  const stack = [...redoState.stack];
-  const item = stack.pop();
-  await writeRedoState(ctx, { sessionId, stack }, state);
-  return item;
-}
-
-async function peekRedoTarget(ctx: ExtensionContext, state?: RuntimeState): Promise<RedoItem | undefined> {
-  const sessionId = ctx.sessionManager.getSessionId();
-  const redoState = await readRedoState(ctx, state);
-  if (!redoState || redoState.sessionId !== sessionId || redoState.stack.length === 0) {
-    return undefined;
-  }
-  return redoState.stack[redoState.stack.length - 1];
-}
-
 function getEntries(ctx: ExtensionContext): SessionEntry[] {
   return ctx.sessionManager.getEntries();
 }
@@ -1235,29 +1178,6 @@ function isUserMessageEntry(entry: SessionEntry | undefined): entry is SessionMe
 
 function getSnapshotEntries(ctx: ExtensionContext): Array<CustomEntry<WorkspaceSnapshot>> {
   return getEntries(ctx).filter(isSnapshotEntry);
-}
-
-function extractUserText(entry: SessionEntry | undefined): string | undefined {
-  if (!isUserMessageEntry(entry)) {
-    return undefined;
-  }
-
-  const message = entry.message;
-  if (message.role !== "user") {
-    return undefined;
-  }
-
-  const content = message.content;
-  if (typeof content === "string") {
-    return content;
-  }
-
-  return content
-    .filter(
-      (item: (typeof content)[number]): item is Extract<(typeof content)[number], { type: "text" }> => item.type === "text",
-    )
-    .map((item: Extract<(typeof content)[number], { type: "text" }>) => item.text)
-    .join("");
 }
 
 function isAssistantTurnMessage(message: unknown): message is { role: string; content: unknown[] } {
@@ -1300,53 +1220,8 @@ function getSnapshotCommit(entry: CustomEntry<WorkspaceSnapshot> | undefined): s
   return hasSnapshotData(entry) ? entry.data.commit : undefined;
 }
 
-function findLastAfterSnapshot(ctx: ExtensionContext, state?: RuntimeState): WorkspaceSnapshot | undefined {
-  let currentId = ctx.sessionManager.getLeafId();
-  while (currentId) {
-    const entry = ctx.sessionManager.getEntry(currentId);
-    if (!entry) {
-      return undefined;
-    }
-
-    const resolved = findAfterSnapshotForMessageAnchor(ctx, entry, state);
-    if (resolved) {
-      return resolved;
-    }
-
-    currentId = entry.parentId ?? null;
-  }
-
-  const turns = getTurnSnapshots(state);
-  const turn = turns[turns.length - 1];
-  return turn ? {
-    v: 1,
-    kind: "after",
-    commit: turn.afterCommit,
-    turnId: turn.turnId,
-    promptText: turn.promptText,
-    userEntryId: turn.userEntryId,
-    assistantEntryId: turn.assistantEntryId,
-    createdAt: turn.createdAt,
-  } : undefined;
-}
-
 function isSlashCommandPrompt(promptText: string | undefined): boolean {
   return typeof promptText === "string" && promptText.trimStart().startsWith("/");
-}
-
-function findUndoTargetAfterSnapshot(ctx: ExtensionContext, state?: RuntimeState): WorkspaceSnapshot | undefined {
-  const currentLeafId = ctx.sessionManager.getLeafId();
-  if (currentLeafId) {
-    const currentEntry = ctx.sessionManager.getEntry(currentLeafId);
-    if (currentEntry && !isSnapshotEntry(currentEntry)) {
-      const resolved = findAfterSnapshotForMessageAnchor(ctx, currentEntry, state);
-      if (resolved) {
-        return resolved;
-      }
-    }
-  }
-
-  return findLastAfterSnapshot(ctx, state);
 }
 
 function findAfterSnapshotOnCurrentBranch(ctx: ExtensionContext, state?: RuntimeState): WorkspaceSnapshot | undefined {
@@ -1380,10 +1255,6 @@ function findTurnSnapshotByUserEntryId(userEntryId: string, state?: RuntimeState
 
 function isAssistantMessageEntry(entry: SessionEntry | undefined): entry is SessionMessageEntry {
   return entry?.type === "message" && entry.message.role === "assistant";
-}
-
-function isMessageEntry(entry: SessionEntry | undefined): entry is SessionMessageEntry {
-  return entry?.type === "message";
 }
 
 function findAfterSnapshotForMessageAnchor(
@@ -1610,31 +1481,6 @@ function scheduleCleanup(ctx: ExtensionContext, state?: RuntimeState): void {
     .finally(() => {
       state.cleanupPromise = undefined;
     });
-}
-
-async function ensureNoUnsnapshottedChanges(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  source: string,
-  state?: RuntimeState,
-): Promise<NavigationPrecheckResult | undefined> {
-  const currentLeafId = ctx.sessionManager.getLeafId() ?? undefined;
-  const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
-
-  try {
-    const dirty = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
-    if (dirty) {
-      await logLine(ctx, `${source} blocked: unsnapshotted changes currentLeaf=${currentLeafId}`, state);
-      ctx.ui.notify("The workspace has unsnapshotted changes. Run /checkpoint first, or clean them up before switching.", "error");
-      return undefined;
-    }
-  } catch (error) {
-    await logLine(ctx, `${source} dirty-check failed currentLeaf=${currentLeafId} error=${String(error)}`, state);
-    ctx.ui.notify("Workspace dirty check failed. Navigation cancelled.", "error");
-    return undefined;
-  }
-
-  return { currentLeafId, currentSnapshot };
 }
 
 async function ensureWorkspaceHistoryAvailable(
@@ -2120,97 +1966,6 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return;
     }
     await clearRedoStack(ctx, state);
-  });
-
-  pi.registerCommand("undo", {
-    description: "Undo last agent turn and restore workspace",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      await ctx.waitForIdle();
-      const state = getState(ctx);
-      if (!await ensureWorkspaceHistoryAvailable(ctx, state, "undo")) {
-        return;
-      }
-      const precheck = await ensureNoUnsnapshottedChanges(pi, ctx, "undo", state);
-      if (!precheck) {
-        return;
-      }
-
-      const after = findUndoTargetAfterSnapshot(ctx, state);
-      if (!after?.userEntryId) {
-        await logLine(ctx, "undo no-op: no after snapshot", state);
-        ctx.ui.notify("Nothing to undo.", "info");
-        return;
-      }
-
-      await logLine(
-        ctx,
-        `undo start currentLeaf=${ctx.sessionManager.getLeafId()} userEntry=${after.userEntryId} beforeCommit=${findBeforeSnapshotForUserEntry(after.userEntryId, state)?.commit}`,
-        state,
-      );
-
-      state.internalNavigation = "undo";
-      try {
-        const result = await ctx.navigateTree(after.userEntryId, { summarize: false });
-        await logLine(ctx, `undo navigate result cancelled=${String(result.cancelled)}`, state);
-        if (result.cancelled) {
-          ctx.ui.notify("Undo cancelled.", "error");
-          return;
-        }
-
-        if (precheck.currentLeafId) {
-          await pushRedoTarget(ctx, precheck.currentLeafId, state);
-        }
-
-        const userText = extractUserText(ctx.sessionManager.getEntry(after.userEntryId));
-        if (userText) {
-          ctx.ui.setEditorText(userText);
-        }
-
-        ctx.ui.notify("Undo complete. Workspace restored to before that turn.", "info");
-      } finally {
-        state.internalNavigation = undefined;
-      }
-    },
-  });
-
-  pi.registerCommand("redo", {
-    description: "Redo previously undone agent turn and restore workspace",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      await ctx.waitForIdle();
-      const state = getState(ctx);
-      if (!await ensureWorkspaceHistoryAvailable(ctx, state, "redo")) {
-        return;
-      }
-      const precheck = await ensureNoUnsnapshottedChanges(pi, ctx, "redo", state);
-      if (!precheck) {
-        return;
-      }
-
-      const redo = await peekRedoTarget(ctx, state);
-      if (!redo) {
-        await logLine(ctx, "redo no-op: empty stack", state);
-        ctx.ui.notify("Nothing to redo.", "info");
-        return;
-      }
-
-      await logLine(ctx, `redo start currentLeaf=${ctx.sessionManager.getLeafId()} target=${redo.targetId}`, state);
-
-      state.internalNavigation = "redo";
-      try {
-        const result = await ctx.navigateTree(redo.targetId, { summarize: false });
-        await logLine(ctx, `redo navigate result cancelled=${String(result.cancelled)}`, state);
-        if (result.cancelled) {
-          ctx.ui.notify("Redo cancelled.", "error");
-          return;
-        }
-
-        await popRedoTarget(ctx, state);
-
-        ctx.ui.notify("Redo complete. Workspace restored.", "info");
-      } finally {
-        state.internalNavigation = undefined;
-      }
-    },
   });
 
   pi.registerCommand("checkpoint", {

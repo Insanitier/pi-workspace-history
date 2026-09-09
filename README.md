@@ -2,9 +2,9 @@
 
 [Chinese version / 中文版](./README.zh-CN.md)
 
-Real workspace undo/redo for Pi.
+Real workspace rollback for Pi.
 
-Bring OpenCode style `/undo` to Pi, with the kind of workspace rollback safety that makes Claude Code feel trustworthy.
+Give Pi's `/tree` history navigation the kind of workspace rollback safety that makes Claude Code feel trustworthy.
 
 ![workspace-history demo](./demo.gif)
 
@@ -19,7 +19,7 @@ Bring OpenCode style `/undo` to Pi, with the kind of workspace rollback safety t
 
 `workspace-history` is a workspace history plugin for `@mariozechner/pi-coding-agent`.
 
-It is not just an extra `/undo` command. The goal is to make chat history navigation restore the real workspace state as well, so the user can move backward, forward, or across branches in history without leaving files behind in the wrong state.
+It is not a one-off rollback shortcut. The goal is to make chat history navigation restore the real workspace state as well, so the user can move backward, forward, or across branches in history without leaving files behind in the wrong state.
 
 Its core goal is:
 
@@ -32,8 +32,8 @@ to the real state associated with that node.
 In other words:
 
 - `/tree` is the actual time machine
-- `/undo` is a shortcut that moves one step backward through `/tree`
-- `/redo` moves back to the location that was just undone
+- Undo is a `/tree` jump back to the prompt of the turn you want to drop; redo is jumping forward to where you were
+- `/checkpoint` protects manual edits before you navigate
 
 ## Why It Exists
 
@@ -50,7 +50,7 @@ This plugin does not try to solve simple text-editor undo. It is meant to restor
 
 Its value is:
 
-- `/undo` can revert a whole agent turn instead of partially rolling back files
+- A single `/tree` jump reverts a whole agent turn instead of partially rolling back files
 - `/tree` becomes real workspace history navigation, not just chat navigation
 - You can move safely between historical branches
 - Manual changes made between agent turns are preserved correctly
@@ -62,22 +62,14 @@ This plugin is built around the following concrete requirements:
 
 1. Record a `before` snapshot before each agent turn starts.
 2. Record an `after` snapshot after each agent turn completes.
-3. Restore the workspace when the user navigates with `/tree`, `/undo`, or `/redo`.
-4. `/undo` must restore the real state from before that turn started, not just the previous post-agent state.
+3. Restore the workspace when the user navigates with `/tree`.
+4. Jumping back over a turn must restore the real state from before that turn started, not just the previous post-agent state.
 5. If the user manually deletes files, edits code, or creates files before the next prompt, those changes must be captured in the next `before` snapshot.
 6. If the workspace contains unsnapshotted manual changes, the plugin should not silently overwrite them. It should block the switch and ask the user to create a `/checkpoint` first.
 7. Internal plugin state must stay isolated from the user project's main Git history.
-8. Multiple sessions must be isolated so snapshots and redo state do not leak across sessions.
+8. Multiple sessions must be isolated so snapshots and session state do not leak across sessions.
 
 ## Main Features
-
-- `/undo`
-  - Restore the workspace to the state from before the most recent agent turn
-  - Put the original user prompt back into the editor for retrying
-
-- `/redo`
-  - Restore the location that was just undone
-  - Restore the corresponding workspace state at the same time
 
 - `/checkpoint [label]`
   - Save the current workspace as a manual checkpoint
@@ -86,14 +78,15 @@ This plugin is built around the following concrete requirements:
 - Workspace restore through `/tree`
   - Asks what to restore on each manual jump: files only, conversation only, or both
   - Supports moving between historical branches
+  - Jumping to a turn's prompt undoes that turn; jumping forward to the entry you left redoes it
 
 - Dirty guard
   - Blocks risky navigation when the workspace contains unsnapshotted manual changes
   - By default, the user is expected to run `/checkpoint` first
 
 - Session isolation
-  - Each session uses its own shadow git and redo state
-  - Prevents a new session from undoing into an older session's history
+  - Each session uses its own shadow git and per-session state
+  - Prevents a new session from navigating into an older session's history
 
 ## How It Works
 
@@ -170,7 +163,6 @@ Notes:
 
 - Manual `/tree` navigation always prompts what to restore: files only (conversation stays put), conversation only (files untouched), or both
 - Summarize-style navigation is treated the same as any other navigation
-- `/undo` and `/redo` always restore files
 
 ## Installation And Usage
 

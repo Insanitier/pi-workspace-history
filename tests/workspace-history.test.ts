@@ -303,6 +303,56 @@ async function countSnapshots(session: Awaited<ReturnType<typeof createSession>>
   }).length;
 }
 
+// /undo and /redo slash commands were removed: tree navigation is the only rollback path.
+// "undo" jumps to the user entry that starts the current turn; pi parks the leaf at that
+// entry's parent (agent-session.js: "User message: leaf = parent"), which is exactly what the
+// old commands did via ctx.navigateTree. "redo" jumps back to the entry the undo left.
+type TestSession = Awaited<ReturnType<typeof createSession>>;
+
+function findUndoTargetEntryId(session: TestSession): string | undefined {
+  const leafId = session.sessionManager.getLeafId();
+  if (!leafId) {
+    return undefined;
+  }
+
+  const leaf = session.sessionManager.getEntry(leafId);
+  if (!leaf) {
+    return undefined;
+  }
+
+  // A leaf that is itself a user message was already rewound past its turn,
+  // so that turn's prompt is a valid undo target.
+  if (leaf.type === "message" && leaf.message.role === "user") {
+    return leaf.id;
+  }
+
+  let currentId: string | undefined = leaf.parentId;
+  while (currentId) {
+    const entry = session.sessionManager.getEntry(currentId);
+    if (!entry) {
+      return undefined;
+    }
+    if (entry.type === "message" && entry.message.role === "user") {
+      return entry.id;
+    }
+    currentId = entry.parentId;
+  }
+
+  return undefined;
+}
+
+async function undoViaTree(session: TestSession): Promise<boolean> {
+  const targetId = findUndoTargetEntryId(session);
+  assert.ok(targetId, "expected an earlier user turn to undo via tree");
+  const nav = await session.navigateTree(targetId, { summarize: false });
+  return nav.cancelled;
+}
+
+async function navigateViaTree(session: TestSession, targetId: string): Promise<boolean> {
+  const nav = await session.navigateTree(targetId, { summarize: false });
+  return nav.cancelled;
+}
+
 async function testUndoRedo(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -324,12 +374,15 @@ async function testUndoRedo(): Promise<void> {
     assert.equal(await exists(filePath), true, "file should exist after the first turn");
     assert.equal(normalizeEol(await readText(filePath)), "hello from turn 1\n");
 
-    await session.prompt("/undo");
-    await waitForExists(filePath, false, "file should be removed after /undo");
+    const turnLeaf = session.sessionManager.getLeafId();
+    assert.ok(turnLeaf, "leaf should exist before undo");
 
-    await session.prompt("/redo");
-    await waitForExists(filePath, true, "file should be restored after /redo");
-    await waitForText(filePath, "hello from turn 1\n", "hello.txt should match after /redo");
+    assert.equal(await undoViaTree(session), false, "tree undo should not be cancelled");
+    await waitForExists(filePath, false, "file should be removed after tree undo");
+
+    await navigateViaTree(session, turnLeaf!);
+    await waitForExists(filePath, true, "file should be restored after tree redo");
+    await waitForText(filePath, "hello from turn 1\n", "hello.txt should match after tree redo");
 
     session.dispose();
   } finally {
@@ -397,7 +450,7 @@ async function testManualChangesProtectedAcrossUndo(): Promise<void> {
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "B turn after snapshot was not created");
     assert.equal(await exists(fileB), true);
 
-    await session.prompt("/undo");
+    assert.equal(await undoViaTree(session), false, "tree undo should not be cancelled");
     await waitForExists(fileB, false, "B should be removed after undoing the second turn");
     await waitForExists(fileA, false, "manually deleted A should not reappear");
 
@@ -437,7 +490,7 @@ async function testCheckpointAndTreeGuard(): Promise<void> {
     assert.ok(baseline, "baseline snapshot should exist");
 
     const treeResult = await session.navigateTree(baseline!.id, { summarize: false });
-    assert.equal(treeResult.cancelled, true, "manual edits without a checkpoint should block /tree");
+    assert.equal(treeResult.cancelled, true, "manual edits without a checkpoint should block tree navigation");
     assert.equal(session.sessionManager.getLeafId(), originalLeafId, "leaf should not change after cancelled navigation");
     assert.equal(normalizeEol(await readText(filePath)), "manual edit\n", "manual edits should be preserved after cancelled navigation");
 
@@ -480,12 +533,12 @@ async function testRepeatedUndo(): Promise<void> {
     assert.equal(await exists(fileB), true);
     assert.equal(await exists(fileC), true);
 
-    await session.prompt("/undo");
+    await undoViaTree(session);
     await waitForExists(fileA, true, "A should remain after the first undo");
     await waitForExists(fileB, false, "B should be removed after the first undo");
     await waitForExists(fileC, false, "C should be removed after the first undo");
 
-    await session.prompt("/undo");
+    await undoViaTree(session);
     await waitForExists(fileA, false, "A should be removed after the second undo");
 
     session.dispose();
@@ -519,7 +572,7 @@ async function testTreeBranchSwitching(): Promise<void> {
       .find((entry) => entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created C branch state");
     assert.ok(cAssistant, "C assistant message should exist");
 
-    await session.prompt("/undo");
+    await undoViaTree(session);
     await waitForText(fileA, "A\n", "after undoing back before C, the file should be A");
 
     await session.prompt("change branch.txt to D");
@@ -564,12 +617,9 @@ async function testUndoDoesNotLeakAcrossSessions(): Promise<void> {
 
     const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
     const session2 = await createSession(ctx2);
-    const beforeLeaf = session2.sessionManager.getLeafId();
-    await session2.prompt("/undo");
-    const afterLeaf = session2.sessionManager.getLeafId();
-
-    assert.equal(beforeLeaf, afterLeaf, "a new session should not jump into old session history on /undo");
-    assert.equal(normalizeEol(await readText(fileA)), "from session 1\n", "a new session /undo should not restore other old session states");
+    assert.equal(findUndoTargetEntryId(session2), undefined, "a new session should not see the previous session's turns");
+    assert.equal(await countSnapshots(session2, ctx2.cwd), 0, "a new session should not load the previous session's snapshots");
+    assert.equal(normalizeEol(await readText(fileA)), "from session 1\n", "a new session should not restore other old session states");
 
     session2.dispose();
     ctx2.provider.unregister();
@@ -588,9 +638,8 @@ async function testNonProjectWorkspaceDisablesExtension(): Promise<void> {
     const nav = await session.navigateTree(session.sessionManager.getLeafId() ?? "", { summarize: false }).catch(() => ({ cancelled: false }));
     assert.equal(nav.cancelled, false, "tree navigation should not be cancelled when workspace history is disabled");
 
-    await session.prompt("/undo");
     await new Promise((resolve) => setTimeout(resolve, 100));
-    await waitFor(async () => (await countSnapshots(session, ctx.cwd)) === 0, "non-project workspace should remain disabled for commands");
+    await waitFor(async () => (await countSnapshots(session, ctx.cwd)) === 0, "non-project workspace should remain disabled for navigation");
 
     await writeFile(path.join(ctx.cwd, "package.json"), JSON.stringify({ name: "timemachine-test-workspace" }, null, 2) + "\n", "utf8");
     ctx.provider.setResponses([
@@ -607,7 +656,7 @@ async function testNonProjectWorkspaceDisablesExtension(): Promise<void> {
   }
 }
 
-async function testUndoWorksFromTreeSelectedUserNode(): Promise<void> {
+async function testTreeJumpFromSelectedUserNode(): Promise<void> {
   const ctx = await createContext();
   try {
     const session = await createSession(ctx);
@@ -630,8 +679,8 @@ async function testUndoWorksFromTreeSelectedUserNode(): Promise<void> {
     const nav = await session.navigateTree(userEntry!.id, { summarize: false });
     assert.equal(nav.cancelled, false, "navigating to the user node should succeed");
 
-    await session.prompt("/undo");
-    await waitForExists(filePath, false, "file should be removed when undo runs from a tree-selected user node");
+    await waitForExists(filePath, false, "file should be removed when navigating from a tree-selected user node");
+    assert.equal(findUndoTargetEntryId(session), undefined, "the selected user node has no earlier turn to undo");
 
     session.dispose();
   } finally {
@@ -756,11 +805,14 @@ async function testPiFilesAreSnapshotManagedExceptInternalState(): Promise<void>
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, ".pi file after snapshot was not created");
     assert.equal(normalizeEol(await readText(piFile)), "pi managed file\n");
 
-    await session.prompt("/undo");
-    await waitForExists(piFile, false, ".pi regular file should be removed after /undo");
+    const piTurnLeaf = session.sessionManager.getLeafId();
+    assert.ok(piTurnLeaf, "leaf should exist before undo");
 
-    await session.prompt("/redo");
-    await waitForText(piFile, "pi managed file\n", ".pi regular file should be restored after /redo");
+    await undoViaTree(session);
+    await waitForExists(piFile, false, ".pi regular file should be removed after tree undo");
+
+    await navigateViaTree(session, piTurnLeaf!);
+    await waitForText(piFile, "pi managed file\n", ".pi regular file should be restored after tree redo");
 
     session.dispose();
   } finally {
@@ -914,11 +966,14 @@ async function testUnicodePathsSurviveUndoRedo(): Promise<void> {
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "unicode path after snapshot was not created");
     await waitForText(filePath, "export const value = 1;\n", "unicode path file should be created");
 
-    await session.prompt("/undo");
-    await waitForExists(filePath, false, "unicode path file should be removed after /undo");
+    const unicodeTurnLeaf = session.sessionManager.getLeafId();
+    assert.ok(unicodeTurnLeaf, "leaf should exist before undo");
 
-    await session.prompt("/redo");
-    await waitForText(filePath, "export const value = 1;\n", "unicode path file should be restored after /redo");
+    await undoViaTree(session);
+    await waitForExists(filePath, false, "unicode path file should be removed after tree undo");
+
+    await navigateViaTree(session, unicodeTurnLeaf!);
+    await waitForText(filePath, "export const value = 1;\n", "unicode path file should be restored after tree redo");
 
     session.dispose();
   } finally {
@@ -942,27 +997,29 @@ async function testUndoAndRedoBlockOnUnsnapshottedManualChanges(): Promise<void>
 
     await writeFile(filePath, "manual edit\n", "utf8");
     const undoLeafBefore = session.sessionManager.getLeafId();
-    await session.prompt("/undo");
+    assert.equal(await undoViaTree(session), true, "tree undo should be blocked by unsnapshotted manual edits");
     const undoLeafAfter = session.sessionManager.getLeafId();
 
-    assert.equal(undoLeafAfter, undoLeafBefore, "/undo should be blocked by unsnapshotted manual edits");
-    assert.equal(normalizeEol(await readText(filePath)), "manual edit\n", "manual edits should remain after blocked /undo");
+    assert.equal(undoLeafAfter, undoLeafBefore, "blocked tree undo should not move the leaf");
+    assert.equal(normalizeEol(await readText(filePath)), "manual edit\n", "manual edits should remain after blocked tree undo");
 
     await session.prompt("/checkpoint guard-manual");
-    await session.prompt("/undo");
+    const guardedTurnLeaf = session.sessionManager.getLeafId();
+    assert.ok(guardedTurnLeaf, "leaf should exist before the unblocked undo");
+    assert.equal(await undoViaTree(session), false, "tree undo should work once manual edits are checkpointed");
     await waitForExists(filePath, false, "file should be removed after undo once manual edits are checkpointed");
 
-    await session.prompt("/redo");
-    await waitForText(filePath, "manual edit\n", "redo should restore the last successfully undone location");
+    assert.equal(await navigateViaTree(session, guardedTurnLeaf!), false, "tree redo should not be cancelled");
+    await waitForText(filePath, "manual edit\n", "tree redo should restore the last successfully undone location");
 
     await writeFile(filePath, "manual redo edit\n", "utf8");
     const redoLeafBefore = session.sessionManager.getLeafId();
-    await session.prompt("/undo");
-    await session.prompt("/redo");
+    await undoViaTree(session);
+    await navigateViaTree(session, guardedTurnLeaf!);
     const redoLeafAfter = session.sessionManager.getLeafId();
 
-    assert.equal(redoLeafAfter, redoLeafBefore, "/redo should be blocked by unsnapshotted manual edits");
-    assert.equal(normalizeEol(await readText(filePath)), "manual redo edit\n", "manual edits should remain after blocked /redo");
+    assert.equal(redoLeafAfter, redoLeafBefore, "tree redo should be blocked by unsnapshotted manual edits");
+    assert.equal(normalizeEol(await readText(filePath)), "manual redo edit\n", "manual edits should remain after blocked tree redo");
 
     session.dispose();
   } finally {
@@ -990,7 +1047,7 @@ async function testGitignoreStopsManagingIgnoredPaths(): Promise<void> {
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, ".gitignore update after snapshot was not created");
 
     await writeFile(ignoredFilePath, "manual ignored edit\n", "utf8");
-    await session.prompt("/undo");
+    await undoViaTree(session);
 
     await waitForText(ignoredFilePath, "manual ignored edit\n", "ignored file should no longer be managed after .gitignore excludes it");
     await waitForExists(path.join(ctx.cwd, ".gitignore"), false, ".gitignore should be removed when undoing to the earlier snapshot");
@@ -1045,13 +1102,13 @@ async function main(): Promise<void> {
     { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
     { name: "idle warmup is reused by first turn", run: testIdleWarmupIsReusedByFirstTurn },
     { name: "non-project workspace disables extension", run: testNonProjectWorkspaceDisablesExtension },
-    { name: "undo/redo restores workspace", run: testUndoRedo },
+    { name: "tree undo/redo restores workspace", run: testUndoRedo },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
     { name: "repeated undo walks back turn by turn", run: testRepeatedUndo },
     { name: "checkpoint and dirty tree guard", run: testCheckpointAndTreeGuard },
     { name: "tree switching restores branch-specific workspace", run: testTreeBranchSwitching },
     { name: "undo does not leak across sessions", run: testUndoDoesNotLeakAcrossSessions },
-    { name: "undo works from tree-selected user node", run: testUndoWorksFromTreeSelectedUserNode },
+    { name: "tree jump from a selected user node restores workspace", run: testTreeJumpFromSelectedUserNode },
     { name: "legacy snapshot entries rebuild turn snapshots", run: testLegacySnapshotEntriesRebuildTurnSnapshots },
     { name: "windows reserved names are excluded from snapshot paths", run: testWindowsReservedNamesAreExcludedFromSnapshotPaths },
     { name: "before commit reuses previous after commit when workspace unchanged", run: testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged },
